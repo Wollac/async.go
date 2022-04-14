@@ -12,7 +12,7 @@ import (
 
 var (
 	ErrStopped       = errors.New("process stopped")
-	ErrInputLength   = errors.New("input too long")
+	ErrDataLength    = errors.New("data too long")
 	ErrInvalidSender = errors.New("invalid sender")
 )
 
@@ -91,7 +91,7 @@ func (r *RBC) Close() error {
 
 func (r *RBC) Input(data []byte) {
 	if len(data) > r.maxLength {
-		panic(fmt.Sprintf("rbc: %v", ErrInputLength))
+		panic(fmt.Sprintf("rbc: %v", ErrDataLength))
 	}
 
 	propose := &Message{Propose, append([]byte{}, data...)}
@@ -117,7 +117,7 @@ func (r *RBC) Handle(sender string, msg *Message) error {
 		return ErrInvalidSender
 	}
 	if len(msg.Data) > r.maxLength {
-		return ErrInputLength
+		return ErrDataLength
 	}
 
 	r.Lock()

@@ -3,19 +3,19 @@ package config
 import (
 	"sort"
 
-	"github.com/multiformats/go-multiaddr"
 	"go.dedis.ch/kyber/v3"
 )
 
+// SelfInfo represents a local node.
 type SelfInfo struct {
 	ID      string
 	PrivKey kyber.Scalar
 }
 
+// PeerInfo represents any peer.
 type PeerInfo struct {
 	ID     string
 	PubKey kyber.Point
-	Addr   []multiaddr.Multiaddr
 }
 
 type Config struct {
@@ -36,6 +36,9 @@ func NewConfig(self SelfInfo, infos ...PeerInfo) *Config {
 	for i, info := range infos {
 		m[info.ID] = &item{index: 0, info: info}
 		ids[i] = info.ID
+	}
+	if _, ok := m[self.ID]; !ok {
+		panic("config: self not contained in peers")
 	}
 
 	sort.Strings(ids)
@@ -78,10 +81,12 @@ func (c *Config) Peers() []PeerInfo {
 	return result
 }
 
+// Index returns the index (0 to N) corresponding to the peer with id.
 func (c *Config) Index(id string) int {
 	return c.peers[id].index
 }
 
+// SelfIndex returns the index (0 to N) corresponding to the own peer.
 func (c *Config) SelfIndex() int {
 	return c.Index(c.self.ID)
 }

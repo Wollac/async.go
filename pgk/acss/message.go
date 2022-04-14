@@ -2,6 +2,7 @@ package acss
 
 import (
 	"errors"
+	"strconv"
 )
 
 var ErrInvalidType = errors.New("invalid message type")
@@ -43,4 +44,14 @@ func (m *Message) UnmarshalBinary(data []byte) error {
 	m.Type = MessageType(data[0])
 	m.Data = data[1:]
 	return nil
+}
+
+type MessageError struct {
+	SenderID string
+	Type     MessageType
+	Str      string
+}
+
+func (e *MessageError) Error() string {
+	return "Invalid " + strconv.Quote(e.Type.String()) + " message: " + e.Str
 }

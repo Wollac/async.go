@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 
 	"github.com/wollac/async.go/pgk/config"
@@ -20,16 +19,6 @@ var (
 	ErrInvalidSender = errors.New("invalid sender")
 )
 
-type MessageError struct {
-	SenderID string
-	Type     MessageType
-	Str      string
-}
-
-func (e *MessageError) Error() string {
-	return "Invalid " + strconv.Quote(e.Type.String()) + " message: " + e.Str
-}
-
 type OutMessage struct {
 	Receiver string
 	Payload  *Message
@@ -38,9 +27,8 @@ type OutMessage struct {
 type ACSS struct {
 	sync.Mutex
 
-	conf     *config.Config
-	suite    suites.Suite
-	dealerID string
+	conf  *config.Config
+	suite suites.Suite
 
 	rbc *rbc.RBC
 
@@ -61,9 +49,9 @@ type ACSS struct {
 
 	implicateIDs map[string]struct{}
 
-	reveal          bool
-	revealIDs       map[string]struct{}
-	recoveredShares map[string]*share.PriShare
+	reveal         bool
+	revealIDs      map[string]struct{}
+	revealedShares map[string]*share.PriShare
 
 	output     bool
 	outputChan chan *share.PriShare
@@ -74,12 +62,11 @@ type ACSS struct {
 
 func New(conf *config.Config, suite suites.Suite, dealer string) *ACSS {
 	// F+1 commitments, ephemeral public key, N encrypted shares
-	broadcastLength := (conf.F()+2)*suite.PointLen() + conf.N()*(suite.ScalarLen()+16)
+	broadcastLength := (conf.F()+2)*suite.PointLen() + conf.N()*(suite.ScalarLen()+AEADOverhead)
 
 	acss := &ACSS{
 		conf:            conf,
 		suite:           suite,
-		dealerID:        dealer,
 		rbc:             rbc.New(conf, dealer, broadcastLength, nil),
 		rbcDone:         false,
 		pubPoly:         nil,
@@ -94,7 +81,7 @@ func New(conf *config.Config, suite suites.Suite, dealer string) *ACSS {
 		implicateIDs:    map[string]struct{}{},
 		reveal:          false,
 		revealIDs:       map[string]struct{}{},
-		recoveredShares: map[string]*share.PriShare{},
+		revealedShares:  map[string]*share.PriShare{},
 		output:          false,
 		outputChan:      make(chan *share.PriShare, 1),
 		stopped:         atomic.Bool{},
@@ -104,30 +91,31 @@ func New(conf *config.Config, suite suites.Suite, dealer string) *ACSS {
 	return acss
 }
 
-func (r *ACSS) Stopped() bool {
-	return r.stopped.Load()
+func (a *ACSS) Stopped() bool {
+	return a.stopped.Load()
 }
 
-func (r *ACSS) Close() error {
-	if !r.stopped.CAS(false, true) {
+func (a *ACSS) Close() error {
+	if !a.stopped.CAS(false, true) {
 		return ErrStopped
 	}
 
-	r.Lock()
-	defer r.Unlock()
+	a.Lock()
+	defer a.Unlock()
 
-	close(r.close)
-	close(r.outputChan)
-	close(r.messagesChan)
+	close(a.close)
+	close(a.outputChan)
+	close(a.messagesChan)
 
-	return r.rbc.Close()
+	return a.rbc.Close()
 }
 
-func (r *ACSS) Input(secret kyber.Scalar) {
+// Input is called by the dealer to start the sharing of the given secret.
+func (a *ACSS) Input(secret kyber.Scalar) {
 	buf := &bytes.Buffer{}
 
 	// generate Feldman commitments
-	poly := share.NewPriPoly(r.suite, r.conf.F()+1, secret, r.suite.RandomStream())
+	poly := share.NewPriPoly(a.suite, a.conf.F()+1, secret, a.suite.RandomStream())
 	_, commits := poly.Commit(nil).Info()
 	// include all F+1 commitments
 	for _, p := range commits {
@@ -137,57 +125,66 @@ func (r *ACSS) Input(secret kyber.Scalar) {
 	}
 
 	// generate ephemeral keypair
-	sk := r.suite.Scalar().Pick(r.suite.RandomStream())
-	pk := r.suite.Point().Mul(sk, nil)
+	sk := a.suite.Scalar().Pick(a.suite.RandomStream())
+	pk := a.suite.Point().Mul(sk, nil)
 	// include ephemeral public key
 	if _, err := pk.MarshalTo(buf); err != nil {
 		panic(fmt.Sprintf("acss: internal error: %v", err))
 	}
 
 	// generate N shares
-	priShares := poly.Shares(r.conf.N())
-	for i, peerInfo := range r.conf.Peers() {
+	priShares := poly.Shares(a.conf.N())
+	for i, peerInfo := range a.conf.Peers() {
 		// compute shared DH key
-		dhBytes := dhExchange(r.suite, sk, peerInfo.PubKey)
+		dhBytes := dhExchange(a.suite, sk, peerInfo.PubKey)
 
-		// encrypt the share using the shared key
-		encryptedShare := encrypt(priShares[i].V, newAEAD(dhBytes, nil))
+		// TODO: use info for domain separation when deriving the key
+		encryptedShare := encryptScalar(priShares[i].V, newAEAD(dhBytes, nil))
 		// include the encrypted share
 		buf.Write(encryptedShare)
 	}
 
 	// broadcast everything
-	r.rbc.Input(buf.Bytes())
+	a.rbc.Input(buf.Bytes())
 }
 
-func (r *ACSS) run() {
+func (a *ACSS) run() {
 	for {
 		select {
-		case rbcMessage := <-r.rbc.Messages():
+
+		// messages of the rbc engine are forwarded
+		case rbcMessage := <-a.rbc.Messages():
 			data, _ := rbcMessage.Payload.MarshalBinary()
 			msg := &Message{RBC, data}
-			r.messagesChan <- &OutMessage{rbcMessage.Receiver, msg}
-		case rbcOutput := <-r.rbc.Output():
-			r.handleRBC(rbcOutput)
-		case <-r.close:
+			a.messagesChan <- &OutMessage{rbcMessage.Receiver, msg}
+
+		// handle the output as soon as the rbc engine is done
+		case rbcOutput := <-a.rbc.Output():
+			a.handleRBC(rbcOutput)
+
+		// acss has been stopped
+		case <-a.close:
 			return
 		}
 	}
 }
 
-func (r *ACSS) Output() chan *share.PriShare {
-	return r.outputChan
+// Output receives the final share.
+func (a *ACSS) Output() chan *share.PriShare {
+	return a.outputChan
 }
 
-func (r *ACSS) Messages() <-chan *OutMessage {
-	return r.messagesChan
+// Messages receives the messages to be sent to other peers.
+func (a *ACSS) Messages() <-chan *OutMessage {
+	return a.messagesChan
 }
 
-func (r *ACSS) Handle(sender string, msg *Message) error {
-	if r.stopped.Load() {
+// Handle must be called for each incoming message of other peers.
+func (a *ACSS) Handle(sender string, msg *Message) error {
+	if a.stopped.Load() {
 		return ErrStopped
 	}
-	if !r.conf.HasPeer(sender) {
+	if !a.conf.HasPeer(sender) {
 		return ErrInvalidSender
 	}
 
@@ -197,21 +194,21 @@ func (r *ACSS) Handle(sender string, msg *Message) error {
 		if err := rbcMessage.UnmarshalBinary(msg.Data); err != nil {
 			return err
 		}
-		return r.rbc.Handle(sender, &rbcMessage)
+		return a.rbc.Handle(sender, &rbcMessage)
 	}
 
-	r.Lock()
-	defer r.Unlock()
-	if r.stopped.Load() {
+	a.Lock()
+	defer a.Unlock()
+	if a.stopped.Load() {
 		return ErrStopped
 	}
 
 	// when we receive non-RBC messages before the broadcast has finished, they need to be cached
-	if !r.rbcDone {
-		senderQueue := r.cache[sender]
+	if !a.rbcDone {
+		senderQueue := a.cache[sender]
 		if senderQueue == nil {
 			senderQueue = map[MessageType]*Message{}
-			r.cache[sender] = senderQueue
+			a.cache[sender] = senderQueue
 		}
 		if _, ok := senderQueue[msg.Type]; ok {
 			return &MessageError{sender, msg.Type, "sent more than once"}
@@ -220,268 +217,277 @@ func (r *ACSS) Handle(sender string, msg *Message) error {
 		return nil
 	}
 
-	return r.handleACSS(sender, msg)
+	return a.handleACSS(sender, msg)
 }
 
-func (r *ACSS) handleRBC(data []byte) {
-	r.Lock()
-	defer r.Unlock()
+func (a *ACSS) handleRBC(data []byte) {
+	a.Lock()
+	defer a.Unlock()
 
-	r.rbcDone = true
-	if err := r.checkRBC(data); err != nil {
-		r.doImplicate()
+	a.rbcDone = true
+	if err := a.checkRBC(data); err != nil {
+		a.doImplicate()
 	} else {
-		r.doOK()
+		a.doOK()
 	}
 
 	// replay cached messages
-	if len(r.cache) > 0 {
-		for sender, queue := range r.cache {
+	if len(a.cache) > 0 {
+		for sender, queue := range a.cache {
 			for _, msg := range queue {
-				_ = r.handleACSS(sender, msg)
+				_ = a.handleACSS(sender, msg)
 			}
 		}
-		r.cache = nil // free cache
+		a.cache = nil // free cache
 	}
 }
 
-func (r *ACSS) handleACSS(sender string, msg *Message) error {
+func (a *ACSS) handleACSS(sender string, msg *Message) error {
 	switch msg.Type {
 	case OK:
-		return r.handleOK(sender)
+		return a.handleOK(sender, msg.Data)
 	case Ready:
-		return r.handleReady(sender)
+		return a.handleReady(sender, msg.Data)
 	case Implicate:
-		return r.handleImplicate(sender, msg.Data)
+		return a.handleImplicate(sender, msg.Data)
 	case Reveal:
-		return r.handleReveal(sender, msg.Data)
+		return a.handleReveal(sender, msg.Data)
 	}
 	return ErrInvalidType
 }
 
-func (r *ACSS) handleOK(sender string) error {
-	if _, has := r.okIDs[sender]; has {
+func (a *ACSS) handleOK(sender string, data []byte) error {
+	if len(data) > 0 {
+		return &MessageError{sender, OK, "data loo long"}
+	}
+	if _, has := a.okIDs[sender]; has {
 		return &MessageError{sender, OK, "sent more than once"}
 	}
-	r.okIDs[sender] = struct{}{}
+	a.okIDs[sender] = struct{}{}
 
-	if r.ready {
+	if a.ready {
 		return nil
 	}
 
-	count := len(r.okIDs)
-	if count > (r.conf.N()+r.conf.F())/2 {
-		r.ready = true
+	count := len(a.okIDs)
+	if count > (a.conf.N()+a.conf.F())/2 {
+		a.ready = true
 
-		if err := r.handleReady(r.conf.Self().ID); err != nil {
+		if err := a.handleReady(a.conf.Self().ID, nil); err != nil {
 			panic(fmt.Sprintf("acss: internal error: %v", err))
 		}
-		r.broadcast(&Message{Ready, nil})
+		a.broadcast(&Message{Ready, nil})
 	}
 	return nil
 }
 
-func (r *ACSS) handleReady(sender string) error {
-	if _, has := r.readyIDs[sender]; has {
+func (a *ACSS) handleReady(sender string, data []byte) error {
+	if len(data) > 0 {
+		return &MessageError{sender, Ready, "data loo long"}
+	}
+	if _, has := a.readyIDs[sender]; has {
 		return &MessageError{sender, Ready, "sent more than once"}
 	}
-	r.readyIDs[sender] = struct{}{}
+	a.readyIDs[sender] = struct{}{}
 
 	// we already output, so there is no need to count messages
-	if r.output {
+	if a.output {
 		return nil
 	}
 
-	count := len(r.readyIDs)
-	if !r.ready && count > r.conf.F() {
-		r.ready = true
+	count := len(a.readyIDs)
+	if !a.ready && count > a.conf.F() {
+		a.ready = true
 
-		if err := r.handleReady(r.conf.Self().ID); err != nil {
+		if err := a.handleReady(a.conf.Self().ID, nil); err != nil {
 			panic(fmt.Sprintf("acss: internal error: %v", err))
 		}
-		r.broadcast(&Message{Ready, nil})
+		a.broadcast(&Message{Ready, nil})
 	}
-	if r.share != nil && count > 2*r.conf.F() {
-		r.output = true
-
-		r.outputChan <- r.share
+	if a.share != nil && count > 2*a.conf.F() {
+		a.output = true
+		a.outputChan <- a.share
 	}
 
 	return nil
 }
 
-func (r *ACSS) handleImplicate(sender string, data []byte) error {
-	if _, has := r.implicateIDs[sender]; has {
+func (a *ACSS) handleImplicate(sender string, data []byte) error {
+	if _, has := a.implicateIDs[sender]; has {
 		return &MessageError{sender, Implicate, "sent more than once"}
 	}
-	r.implicateIDs[sender] = struct{}{}
+	a.implicateIDs[sender] = struct{}{}
 
-	if err := r.checkImplicate(sender, data); err != nil {
-		return err
+	if err := a.checkImplicate(sender, data); err != nil {
+		return &MessageError{sender, Implicate, err.Error()}
 	}
-
+	// we now have a proof that the dealer is faulty, and we can reveal our share
 	// reveal the shared DH key, if a valid share was received
-	if r.share == nil || r.reveal {
+	if a.share == nil || a.reveal {
 		return nil
 	}
 
 	// compute shared DH key
-	dhBytes := dhExchange(r.suite, r.conf.Self().PrivKey, r.sharesPubKey)
+	dhBytes := dhExchange(a.suite, a.conf.Self().PrivKey, a.sharesPubKey)
 
 	// reveal the shared key
-	r.reveal = true
-	if err := r.handleReveal(r.conf.Self().ID, dhBytes); err != nil {
+	a.reveal = true
+	if err := a.handleReveal(a.conf.Self().ID, dhBytes); err != nil {
 		panic(fmt.Sprintf("acss: internal error: %v", err))
 	}
-	r.broadcast(&Message{Reveal, dhBytes})
+	a.broadcast(&Message{Reveal, dhBytes})
 
 	return nil
 }
 
-func (r *ACSS) handleReveal(sender string, data []byte) error {
-	if len(data) != r.suite.PointLen() {
+func (a *ACSS) handleReveal(sender string, data []byte) error {
+	if len(data) != a.suite.PointLen() {
 		return &MessageError{sender, Reveal, "invalid data length"}
 	}
-	if _, has := r.revealIDs[sender]; has {
+	if _, has := a.revealIDs[sender]; has {
 		return &MessageError{sender, Reveal, "sent more than once"}
 	}
-	r.revealIDs[sender] = struct{}{}
+	a.revealIDs[sender] = struct{}{}
 
-	index := r.conf.Index(sender)
-	v := r.suite.Scalar()
-	if err := decrypt(v, newAEAD(data, nil), r.encryptedShares[index]); err != nil {
-		return err
+	index := a.conf.Index(sender)
+	v := a.suite.Scalar()
+	if err := decryptScalar(v, newAEAD(data, nil), a.encryptedShares[index]); err != nil {
+		return &MessageError{sender, Reveal, "invalid secret revealed"}
 	}
 	s := &share.PriShare{I: index, V: v}
-	if !r.pubPoly.Check(s) {
-		return errors.New("invalid share")
+	if !a.pubPoly.Check(s) {
+		return &MessageError{sender, Reveal, "invalid share revealed"}
 	}
-
-	if r.share != nil {
+	// if we do not have a valid share, there is nothing to reveal
+	if a.share != nil {
 		return nil
 	}
 
-	r.recoveredShares[sender] = s
-	if len(r.recoveredShares) > r.conf.F() {
+	// store the resulting revealed share
+	a.revealedShares[sender] = s
+	if len(a.revealedShares) > a.conf.F() {
 		var shares []*share.PriShare
-		for _, priShare := range r.recoveredShares {
+		for _, priShare := range a.revealedShares {
 			shares = append(shares, priShare)
 		}
 		// recover the priShare that we were supposed to receive
-		poly, err := share.RecoverPriPoly(r.suite, shares, r.conf.F()+1, r.conf.N())
+		poly, err := share.RecoverPriPoly(a.suite, shares, a.conf.F()+1, a.conf.N())
 		if err != nil {
-			panic(err)
+			panic(fmt.Sprintf("acss: internal error: %v", err))
 		}
-		r.share = poly.Eval(r.conf.SelfIndex())
-		r.doOK()
-		// make sure to output, even when READY was already sent
-		if !r.output && len(r.readyIDs) > 2*r.conf.F() {
-			r.output = true
-			r.outputChan <- r.share
+		a.share = poly.Eval(a.conf.SelfIndex())
+		// send OK as a valid share was received
+		a.doOK()
+		// make sure to output, even when a READY was already sent
+		if !a.output && len(a.readyIDs) > 2*a.conf.F() {
+			a.output = true
+			a.outputChan <- a.share
 		}
 	}
 
 	return nil
 }
 
-func (r *ACSS) doOK() {
-	if err := r.handleOK(r.conf.Self().ID); err != nil {
+func (a *ACSS) doOK() {
+	if err := a.handleOK(a.conf.Self().ID, nil); err != nil {
 		panic(fmt.Sprintf("acss: internal error: %v", err))
 	}
-	r.broadcast(&Message{OK, nil})
+	a.broadcast(&Message{OK, nil})
 }
 
-func (r *ACSS) doImplicate() {
+// doImplicate sends and IMPLICATE message with shared key and proof of correctness.
+func (a *ACSS) doImplicate() {
 	// compute shared DH key
-	dhBytes := dhExchange(r.suite, r.conf.Self().PrivKey, r.sharesPubKey)
+	dhBytes := dhExchange(a.suite, a.conf.Self().PrivKey, a.sharesPubKey)
 	// sign to prove that privKey * sharesPubKey = dhKey, without revealing privKey
-	sig, err := Sign(r.suite, r.sharesPubKey, r.conf.Self().PrivKey, dhBytes)
+	sig, err := Sign(a.suite, a.sharesPubKey, a.conf.Self().PrivKey, dhBytes)
 	if err != nil {
 		panic(fmt.Sprintf("acss: internal error: %v", err))
 	}
 
 	data := append(dhBytes, sig...)
-	if err := r.handleImplicate(r.conf.Self().ID, data); err != nil {
+	if err := a.handleImplicate(a.conf.Self().ID, data); err != nil {
 		panic(fmt.Sprintf("acss: internal error: %v", err))
 	}
-	r.broadcast(&Message{Implicate, data})
+	a.broadcast(&Message{Implicate, data})
 }
 
-func (r *ACSS) checkRBC(data []byte) error {
+func (a *ACSS) checkRBC(data []byte) error {
 	buf := bytes.NewBuffer(data)
 
 	// load all F+1 commitments
-	commits := make([]kyber.Point, r.conf.F()+1)
+	commits := make([]kyber.Point, a.conf.F()+1)
 	for i := range commits {
-		p := r.suite.Point()
+		p := a.suite.Point()
 		if _, err := p.UnmarshalFrom(buf); err != nil {
 			return err
 		}
 		commits[i] = p
 	}
-	r.pubPoly = share.NewPubPoly(r.suite, nil, commits)
+	a.pubPoly = share.NewPubPoly(a.suite, nil, commits)
 
 	// load the ephemeral public key
-	r.sharesPubKey = r.suite.Point()
-	if _, err := r.sharesPubKey.UnmarshalFrom(buf); err != nil {
+	a.sharesPubKey = a.suite.Point()
+	if _, err := a.sharesPubKey.UnmarshalFrom(buf); err != nil {
 		return err
 	}
-	// TODO: do we need to check for non-canonical or small-order points
+	// TODO: check for non-canonical or small-order points
 
 	// load all N encrypted shares
-	encryptedDealSize := r.suite.ScalarLen() + 16
-	r.encryptedShares = make([][]byte, r.conf.N())
-	for i := range r.encryptedShares {
-		r.encryptedShares[i] = make([]byte, encryptedDealSize)
-		if _, err := buf.Read(r.encryptedShares[i]); err != nil {
+	encryptedDealSize := a.suite.ScalarLen() + AEADOverhead
+	a.encryptedShares = make([][]byte, a.conf.N())
+	for i := range a.encryptedShares {
+		a.encryptedShares[i] = make([]byte, encryptedDealSize)
+		if _, err := buf.Read(a.encryptedShares[i]); err != nil {
 			return err
 		}
 	}
 
 	// compute shared DH key
-	dhBytes := dhExchange(r.suite, r.conf.Self().PrivKey, r.sharesPubKey)
+	dhBytes := dhExchange(a.suite, a.conf.Self().PrivKey, a.sharesPubKey)
 
-	// decrypt the scalar
-	index := r.conf.SelfIndex()
-	v := r.suite.Scalar()
-	if err := decrypt(v, newAEAD(dhBytes, nil), r.encryptedShares[index]); err != nil {
+	// decryptScalar the scalar
+	index := a.conf.SelfIndex()
+	v := a.suite.Scalar()
+	if err := decryptScalar(v, newAEAD(dhBytes, nil), a.encryptedShares[index]); err != nil {
 		return err
 	}
 	s := &share.PriShare{I: index, V: v}
-	if r.pubPoly.Check(s) != true {
+	if a.pubPoly.Check(s) != true {
 		return errors.New("invalid share")
 	}
 
-	r.share = s
+	a.share = s
 	return nil
 }
 
-func (r *ACSS) checkImplicate(sender string, data []byte) error {
-	if len(data) != 2*r.suite.PointLen()+r.suite.ScalarLen() {
-		return errors.New("invalid data")
+// checkImplicate verifies that the IMPLICATE message is a correct proof of a faulty dealer.
+func (a *ACSS) checkImplicate(sender string, data []byte) error {
+	if len(data) != 2*a.suite.PointLen()+a.suite.ScalarLen() {
+		return errors.New("invalid data length")
 	}
-	dhBytes := data[:r.suite.PointLen()]
-	sig := data[r.suite.PointLen():]
+	dhBytes := data[:a.suite.PointLen()]
+	sig := data[a.suite.PointLen():]
 
-	dh := r.suite.Point()
+	dh := a.suite.Point()
 	if err := dh.UnmarshalBinary(dhBytes); err != nil {
 		return fmt.Errorf("invalid key: %w", err)
 	}
-	// TODO: do we need to check for non-canonical or small-order points
+	// TODO: check for non-canonical or small-order points
 
-	if err := Verify(r.suite, r.sharesPubKey, dh, dhBytes, sig); err != nil {
+	if err := Verify(a.suite, a.sharesPubKey, dh, dhBytes, sig); err != nil {
 		return fmt.Errorf("invalid signature: %w", err)
 	}
 
-	index := r.conf.Index(sender)
-	v := r.suite.Scalar()
-	if err := decrypt(v, newAEAD(dhBytes, nil), r.encryptedShares[index]); err != nil {
-		// if the decrypt fails, the implication is correct
+	index := a.conf.Index(sender)
+	v := a.suite.Scalar()
+	if err := decryptScalar(v, newAEAD(dhBytes, nil), a.encryptedShares[index]); err != nil {
+		// if the decryptScalar fails, the implication is correct
 		return nil
 	}
 
 	s := &share.PriShare{I: index, V: v}
-	if !r.pubPoly.Check(s) {
+	if !a.pubPoly.Check(s) {
 		// if the VSS verification fails, the implication is correct
 		return nil
 	}
@@ -489,10 +495,10 @@ func (r *ACSS) checkImplicate(sender string, data []byte) error {
 	return errors.New("encrypted share is valid")
 }
 
-func (r *ACSS) broadcast(msg *Message) {
-	for _, peer := range r.conf.IDs() {
-		if peer != r.conf.Self().ID {
-			r.messagesChan <- &OutMessage{peer, msg}
+func (a *ACSS) broadcast(msg *Message) {
+	for _, peer := range a.conf.IDs() {
+		if peer != a.conf.Self().ID {
+			a.messagesChan <- &OutMessage{peer, msg}
 		}
 	}
 }

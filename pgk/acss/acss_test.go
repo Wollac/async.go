@@ -20,20 +20,16 @@ func TestSingle(t *testing.T) {
 	acss := New(conf, suite, "A")
 	secret := suite.Scalar().Pick(suite.RandomStream())
 	acss.Input(secret)
-	s := <-acss.Output()
-	require.Equal(t, secret, s.V)
+	out := <-acss.Output()
+	require.NotNil(t, out)
+	require.Equal(t, secret, out.V)
 	require.NoError(t, acss.Close())
 }
 
 func TestTermination(t *testing.T) {
-	selfs, peers := generateKeys("A", "B", "C", "D")
-	nodes := map[string]*ACSS{}
-	for _, self := range selfs {
-		conf := config.NewConfig(self, peers...)
-		nodes[self.ID] = New(conf, suite, "A")
-		defer nodes[self.ID].Close()
-	}
-
+	nodes, shutdown := createNodes("A", "A", "B", "C", "D")
+	defer shutdown()
+	// link the nodes by handling each other's messages
 	for id, node := range nodes {
 		id, node := id, node
 		go func() {
@@ -56,18 +52,14 @@ func TestTermination(t *testing.T) {
 }
 
 func TestReveal(t *testing.T) {
-	selfs, peers := generateKeys("A", "B", "C", "D")
-	nodes := map[string]*ACSS{}
-	for _, self := range selfs {
-		conf := config.NewConfig(self, peers...)
-		nodes[self.ID] = New(conf, suite, "A")
-		defer nodes[self.ID].Close()
-	}
+	nodes, shutdown := createNodes("A", "A", "B", "C", "D")
+	defer shutdown()
 
 	for id, node := range nodes {
 		id, node := id, node
 		go func() {
 			for msg := range node.Messages() {
+				// modify RBC-PROPOSE messages so that the signatures are invalid
 				if msg.Payload.Type == RBC {
 					rbcMessage := &rbc.Message{}
 					require.NoError(t, rbcMessage.UnmarshalBinary(msg.Payload.Data))
@@ -108,4 +100,19 @@ func generateKeys(ids ...string) (selfs []config.SelfInfo, peers []config.PeerIn
 		peers = append(peers, config.PeerInfo{ID: id, PubKey: p})
 	}
 	return
+}
+
+func createNodes(dealer string, ids ...string) (map[string]*ACSS, func()) {
+	selfs, peers := generateKeys(ids...)
+	nodes := map[string]*ACSS{}
+	for _, self := range selfs {
+		conf := config.NewConfig(self, peers...)
+		nodes[self.ID] = New(conf, suite, dealer)
+	}
+	shutdown := func() {
+		for _, node := range nodes {
+			_ = node.Close()
+		}
+	}
+	return nodes, shutdown
 }

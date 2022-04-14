@@ -15,6 +15,11 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
+const (
+	AEADKeySize  = chacha20poly1305.KeySize
+	AEADOverhead = chacha20poly1305.Overhead
+)
+
 // dhExchange computes the shared key from a private key and a public key
 func dhExchange(group kyber.Group, ownPrivate kyber.Scalar, remotePublic kyber.Point) []byte {
 	dh := group.Point().Mul(ownPrivate, remotePublic)
@@ -25,9 +30,10 @@ func dhExchange(group kyber.Group, ownPrivate kyber.Scalar, remotePublic kyber.P
 	return data
 }
 
+// newAEAD creates a new AEAD cipher based on secret and info.
 func newAEAD(secret []byte, info []byte) cipher.AEAD {
 	h := hkdf.New(sha256.New, secret, nil, info)
-	key := make([]byte, chacha20poly1305.KeySize)
+	key := make([]byte, AEADKeySize)
 	if _, err := io.ReadFull(h, key); err != nil {
 		panic(fmt.Sprintf("acss: internal error: %v", err))
 	}
@@ -42,7 +48,8 @@ func newAEAD(secret []byte, info []byte) cipher.AEAD {
 	return aead
 }
 
-func encrypt(s kyber.Scalar, aead cipher.AEAD) []byte {
+// encryptScalar encrypts a scalar and returns the cipher text.
+func encryptScalar(s kyber.Scalar, aead cipher.AEAD) []byte {
 	sBytes, err := s.MarshalBinary()
 	if err != nil {
 		panic(err)
@@ -51,7 +58,8 @@ func encrypt(s kyber.Scalar, aead cipher.AEAD) []byte {
 	return aead.Seal(nil, nonce, sBytes, nil)
 }
 
-func decrypt(dst kyber.Scalar, aead cipher.AEAD, cipherText []byte) error {
+// decryptScalar decrypts cipherText and sets the corresponding scalar dst.
+func decryptScalar(dst kyber.Scalar, aead cipher.AEAD, cipherText []byte) error {
 	nonce := make([]byte, aead.NonceSize())
 	plaintext, err := aead.Open(nil, nonce, cipherText, nil)
 	if err != nil {
@@ -63,7 +71,8 @@ func decrypt(dst kyber.Scalar, aead cipher.AEAD, cipherText []byte) error {
 	return nil
 }
 
-// Sign is a copy from go.dedis.ch/kyber/v3/sign/schnorr allowing for non-standard base points.
+// Sign creates a signature from a msg and a private key using base as the base point.
+// It is a copy of schnorr.Sign from go.dedis.ch/kyber/v3/sign/schnorr supporting a non-standard base point.
 func Sign(s suites.Suite, base kyber.Point, private kyber.Scalar, msg []byte) ([]byte, error) {
 	var g kyber.Group = s
 	// create random secret k and public point commitment R
@@ -92,7 +101,8 @@ func Sign(s suites.Suite, base kyber.Point, private kyber.Scalar, msg []byte) ([
 	return b.Bytes(), nil
 }
 
-// Verify is a copy from go.dedis.ch/kyber/v3/sign/schnorr allowing for non-standard base points.
+// Verify verifies a given Schnorr signature. It returns nil iff the given signature is valid.
+// It is a copy of schnorr.VerifyWithChecks from go.dedis.ch/kyber/v3/sign/schnorr supporting a non-standard base point.
 func Verify(g kyber.Group, base kyber.Point, public kyber.Point, msg, sig []byte) error {
 	type scalarCanCheckCanonical interface {
 		IsCanonical(b []byte) bool
