@@ -38,14 +38,7 @@ func TestTermination(t *testing.T) {
 		id, node := id, node
 		go func() {
 			for msg := range node.Messages() {
-				receiver, payload := nodes[msg.Receiver], msg.Payload
-				go func() {
-					time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
-					if !receiver.Stopped() {
-						t.Logf("%s->%s: %s", id, receiver.conf.Self().ID, payload.Type)
-						require.NoError(t, receiver.Handle(id, payload))
-					}
-				}()
+				go handle(t, id, nodes[msg.Receiver], msg.Payload)
 			}
 		}()
 	}
@@ -75,21 +68,14 @@ func TestReveal(t *testing.T) {
 		id, node := id, node
 		go func() {
 			for msg := range node.Messages() {
-				receiver, payload := nodes[msg.Receiver], msg.Payload
-				if payload.Type == RBC {
+				if msg.Payload.Type == RBC {
 					rbcMessage := &rbc.Message{}
-					require.NoError(t, rbcMessage.UnmarshalBinary(payload.Data))
+					require.NoError(t, rbcMessage.UnmarshalBinary(msg.Payload.Data))
 					if rbcMessage.Type == rbc.Propose {
 						rbcMessage.Data[len(rbcMessage.Data)-1]++
 					}
 				}
-				go func() {
-					time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
-					if !receiver.Stopped() {
-						t.Logf("%s->%s: %s", id, receiver.conf.Self().ID, payload.Type)
-						require.NoError(t, receiver.Handle(id, payload))
-					}
-				}()
+				go handle(t, id, nodes[msg.Receiver], msg.Payload)
 			}
 		}()
 	}
@@ -104,6 +90,14 @@ func TestReveal(t *testing.T) {
 	recoverSecret, err := share.RecoverSecret(suite, shares, 2, 4)
 	require.NoError(t, err)
 	require.Equal(t, secret, recoverSecret)
+}
+
+func handle(t *testing.T, srcID string, dst *ACSS, message *Message) {
+	time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
+	if !dst.Stopped() {
+		t.Logf("%s->%s: %s", srcID, dst.conf.Self().ID, message.Type)
+		require.NoError(t, dst.Handle(srcID, message))
+	}
 }
 
 func generateKeys(ids ...string) (selfs []config.SelfInfo, peers []config.PeerInfo) {

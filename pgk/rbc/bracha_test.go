@@ -1,7 +1,10 @@
 package rbc
 
 import (
+	"encoding/binary"
+	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/wollac/async.go/pgk/config"
@@ -17,13 +20,13 @@ func TestSingle(t *testing.T) {
 	require.NoError(t, rbc.Close())
 }
 
-/*
 func TestTermination(t *testing.T) {
-	conf := config.NewConfig(config.PeerInfo{ID: "A"}, config.PeerInfo{ID: "B"}, config.PeerInfo{ID: "C"}, config.PeerInfo{ID: "D"})
+	peers := []config.PeerInfo{{ID: "A"}, {ID: "B"}, {ID: "C"}, {ID: "D"}}
 	rbcs := map[string]*RBC{}
-	for _, peer := range conf.IDs() {
-		rbcs[peer] = New(conf, peer, "A", len(testData), nil)
-		defer rbcs[peer].Close()
+	for _, peer := range peers {
+		conf := config.NewConfig(config.SelfInfo{ID: peer.ID}, peers...)
+		rbcs[peer.ID] = New(conf, "A", len(testData), nil)
+		defer rbcs[peer.ID].Close()
 	}
 
 	for sender, rbc := range rbcs {
@@ -46,10 +49,10 @@ func TestTermination(t *testing.T) {
 }
 
 func BenchmarkBracha(b *testing.B) {
-	conf := config.NewConfig(config.PeerInfo{ID: "A"}, config.PeerInfo{ID: "B"})
+	peers := []config.PeerInfo{{ID: "A"}, {ID: "B"}}
 	link := func(s, d *RBC) {
 		for msg := range s.Messages() {
-			d.Handle(s.self, msg.Payload)
+			d.Handle(s.conf.Self().ID, msg.Payload)
 		}
 	}
 	b.ResetTimer()
@@ -57,8 +60,8 @@ func BenchmarkBracha(b *testing.B) {
 	var data [4]byte
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		rbcA := New(conf, "A", "A", len(data), nil)
-		rbcB := New(conf, "B", "A", len(data), nil)
+		rbcA := New(config.NewConfig(config.SelfInfo{ID: "A"}, peers...), "A", len(data), nil)
+		rbcB := New(config.NewConfig(config.SelfInfo{ID: "B"}, peers...), "A", len(data), nil)
 		go link(rbcA, rbcB)
 		go link(rbcB, rbcA)
 		b.StartTimer()
@@ -74,4 +77,3 @@ func BenchmarkBracha(b *testing.B) {
 		b.StartTimer()
 	}
 }
-*/
