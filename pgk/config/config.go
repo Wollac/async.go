@@ -65,6 +65,10 @@ func (c *Config) HasPeer(peer string) bool {
 	return contains
 }
 
+func (c *Config) PubKey(peer string) kyber.Point {
+	return c.peers[peer].info.PubKey
+}
+
 func (c *Config) IDs() []string {
 	result := make([]string, c.N())
 	for id, peer := range c.peers {
@@ -77,6 +81,14 @@ func (c *Config) Peers() []PeerInfo {
 	result := make([]PeerInfo, c.N())
 	for _, peer := range c.peers {
 		result[peer.index] = peer.info
+	}
+	return result
+}
+
+func (c *Config) PubKeys() []kyber.Point {
+	result := make([]kyber.Point, c.N())
+	for _, peer := range c.peers {
+		result[peer.index] = peer.info.PubKey
 	}
 	return result
 }
