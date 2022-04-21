@@ -7,6 +7,8 @@ import (
 	"go.dedis.ch/kyber/v3"
 )
 
+// PointUnmarshalFrom decodes the content of the point P by reading from an io.Reader.
+// It performs all additional sanity checks, if present.
 func PointUnmarshalFrom(P kyber.Point, r io.Reader) (int, error) {
 	data := make([]byte, P.MarshalSize())
 	n, err := io.ReadFull(r, data)
@@ -26,6 +28,8 @@ func PointUnmarshalFrom(P kyber.Point, r io.Reader) (int, error) {
 	return n, nil
 }
 
+// ScalarUnmarshalFrom decodes the content of the scalar s by reading from an io.Reader.
+// It performs all additional sanity checks, if present.
 func ScalarUnmarshalFrom(s kyber.Scalar, r io.Reader) (int, error) {
 	data := make([]byte, s.MarshalSize())
 	n, err := io.ReadFull(r, data)

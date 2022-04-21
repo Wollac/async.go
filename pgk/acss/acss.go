@@ -9,7 +9,6 @@ import (
 	"github.com/wollac/async.go/pgk/config"
 	"github.com/wollac/async.go/pgk/rbc"
 	"go.dedis.ch/kyber/v3"
-	"go.dedis.ch/kyber/v3/share"
 	"go.dedis.ch/kyber/v3/suites"
 	"go.uber.org/atomic"
 )
@@ -32,11 +31,9 @@ type ACSS struct {
 
 	rbc *rbc.RBC
 
-	rbcDone         bool            // whether the RBC has finished
-	pubPoly         *share.PubPoly  // Feldman VSS commitments
-	dealerPubKey    kyber.Point     // public key used to encrypt the shares
-	encryptedShares [][]byte        // encrypted shares of all peers
-	share           *share.PriShare // own share
+	rbcDone bool         // whether the RBC has finished
+	deal    *crypto.Deal // deal distributed by the dealer
+	share   crypto.Share // own private share of the secret
 
 	cache map[string]map[MessageType]*Message // ACSS messages received during RBC
 
@@ -51,10 +48,10 @@ type ACSS struct {
 
 	reveal         bool
 	revealIDs      map[string]struct{}
-	revealedShares map[string]*share.PriShare
+	revealedShares map[string]crypto.Share
 
 	output     bool
-	outputChan chan *share.PriShare
+	outputChan chan crypto.Share
 
 	stopped atomic.Bool
 	close   chan struct{}
@@ -62,27 +59,25 @@ type ACSS struct {
 
 func New(conf *config.Config, suite suites.Suite, dealer string) *ACSS {
 	acss := &ACSS{
-		conf:            conf,
-		suite:           suite,
-		rbc:             rbc.New(conf, dealer, crypto.DealLen(suite, conf.N()), nil),
-		rbcDone:         false,
-		pubPoly:         nil,
-		dealerPubKey:    nil,
-		encryptedShares: nil,
-		share:           nil,
-		cache:           map[string]map[MessageType]*Message{},
-		messagesChan:    make(chan *OutMessage, conf.N()-1),
-		okIDs:           map[string]struct{}{},
-		ready:           false,
-		readyIDs:        map[string]struct{}{},
-		implicateIDs:    map[string]struct{}{},
-		reveal:          false,
-		revealIDs:       map[string]struct{}{},
-		revealedShares:  map[string]*share.PriShare{},
-		output:          false,
-		outputChan:      make(chan *share.PriShare, 1),
-		stopped:         atomic.Bool{},
-		close:           make(chan struct{}),
+		conf:           conf,
+		suite:          suite,
+		rbc:            rbc.New(conf, dealer, crypto.DealLen(suite, conf.N()), nil),
+		rbcDone:        false,
+		deal:           nil,
+		share:          nil,
+		cache:          map[string]map[MessageType]*Message{},
+		messagesChan:   make(chan *OutMessage, conf.N()-1),
+		okIDs:          map[string]struct{}{},
+		ready:          false,
+		readyIDs:       map[string]struct{}{},
+		implicateIDs:   map[string]struct{}{},
+		reveal:         false,
+		revealIDs:      map[string]struct{}{},
+		revealedShares: map[string]crypto.Share{},
+		output:         false,
+		outputChan:     make(chan crypto.Share, 1),
+		stopped:        atomic.Bool{},
+		close:          make(chan struct{}),
 	}
 	go acss.run()
 	return acss
@@ -109,9 +104,12 @@ func (a *ACSS) Close() error {
 
 // Input is called by the dealer to start the sharing of the given secret.
 func (a *ACSS) Input(secret kyber.Scalar) {
-	// create the deal
-	data := crypto.Deal(a.suite, a.conf.PubKeys(), secret)
-	// broadcast everything
+	// broadcast the deal
+	deal := crypto.NewDeal(a.suite, a.conf.PubKeys(), secret)
+	data, err := deal.MarshalBinary()
+	if err != nil {
+		panic(fmt.Sprintf("acss: internal error: %v", err))
+	}
 	a.rbc.Input(data)
 }
 
@@ -137,7 +135,7 @@ func (a *ACSS) run() {
 }
 
 // Output receives the final share.
-func (a *ACSS) Output() chan *share.PriShare {
+func (a *ACSS) Output() chan crypto.Share {
 	return a.outputChan
 }
 
@@ -192,15 +190,13 @@ func (a *ACSS) handleRBC(data []byte) {
 	defer a.Unlock()
 
 	a.rbcDone = true
-	pubPoly, dealerPubKey, shares, err := crypto.CheckDeal(a.suite, a.conf.N(), data)
+	deal, err := crypto.DealUnmarshalBinary(a.suite, a.conf.N(), data)
 	if err == nil {
-		a.pubPoly = pubPoly
-		a.dealerPubKey = dealerPubKey
-		a.encryptedShares = shares
+		a.deal = deal
 
 		// try to extract our share
-		secret := crypto.Secret(a.suite, dealerPubKey, a.conf.Self().PrivKey)
-		a.share, err = crypto.DecryptShare(a.suite, pubPoly, shares, a.conf.SelfIndex(), secret)
+		secret := crypto.Secret(a.suite, a.deal.PubKey, a.conf.Self().PrivKey)
+		a.share, err = crypto.DecryptShare(a.suite, a.deal, a.conf.SelfIndex(), secret)
 		if err != nil {
 			a.doImplicate()
 		} else {
@@ -305,7 +301,7 @@ func (a *ACSS) handleImplicate(sender string, data []byte) error {
 	}
 
 	// compute shared DH secret
-	secret := crypto.Secret(a.suite, a.dealerPubKey, a.conf.Self().PrivKey)
+	secret := crypto.Secret(a.suite, a.deal.PubKey, a.conf.Self().PrivKey)
 	// reveal the shared secret
 	a.reveal = true
 	if err := a.handleReveal(a.conf.Self().ID, secret); err != nil {
@@ -323,7 +319,7 @@ func (a *ACSS) handleReveal(sender string, data []byte) error {
 	a.revealIDs[sender] = struct{}{}
 
 	index := a.conf.Index(sender)
-	s, err := crypto.DecryptShare(a.suite, a.pubPoly, a.encryptedShares, index, data)
+	s, err := crypto.DecryptShare(a.suite, a.deal, index, data)
 	if err != nil {
 		return &MessageError{sender, Reveal, "invalid secret revealed"}
 	}
@@ -336,16 +332,15 @@ func (a *ACSS) handleReveal(sender string, data []byte) error {
 	// store the resulting revealed share
 	a.revealedShares[sender] = s
 	if len(a.revealedShares) > a.conf.F() {
-		var shares []*share.PriShare
+		var shares []crypto.Share
 		for _, priShare := range a.revealedShares {
 			shares = append(shares, priShare)
 		}
 		// recover the priShare that we were supposed to receive
-		poly, err := share.RecoverPriPoly(a.suite, shares, a.conf.F()+1, a.conf.N())
+		a.share, err = crypto.InterpolateShare(a.suite, shares, a.conf.N(), a.conf.SelfIndex())
 		if err != nil {
 			panic(fmt.Sprintf("acss: internal error: %v", err))
 		}
-		a.share = poly.Eval(a.conf.SelfIndex())
 		// send OK as a valid share was received
 		a.doOK()
 		// make sure to output, even when a READY was already sent
@@ -367,7 +362,7 @@ func (a *ACSS) doOK() {
 
 // doImplicate sends and IMPLICATE message with shared key and proof of correctness.
 func (a *ACSS) doImplicate() {
-	data := crypto.Implicate(a.suite, a.dealerPubKey, a.conf.Self().PrivKey)
+	data := crypto.Implicate(a.suite, a.deal.PubKey, a.conf.Self().PrivKey)
 	if err := a.handleImplicate(a.conf.Self().ID, data); err != nil {
 		panic(fmt.Sprintf("acss: internal error: %v", err))
 	}
@@ -376,13 +371,13 @@ func (a *ACSS) doImplicate() {
 
 // checkImplicate verifies that the IMPLICATE message is a correct proof of a faulty dealer.
 func (a *ACSS) checkImplicate(sender string, data []byte) error {
-	secret, err := crypto.CheckImplicate(a.suite, a.dealerPubKey, a.conf.PubKey(sender), data)
+	secret, err := crypto.CheckImplicate(a.suite, a.deal.PubKey, a.conf.PubKey(sender), data)
 	if err != nil {
 		return fmt.Errorf("invalid proof: %w", err)
 	}
 
 	index := a.conf.Index(sender)
-	_, err = crypto.DecryptShare(a.suite, a.pubPoly, a.encryptedShares, index, secret)
+	_, err = crypto.DecryptShare(a.suite, a.deal, index, secret)
 	if err == nil {
 		// if we are able to decrypt the share, the implication is not correct
 		return errors.New("encrypted share is valid")
