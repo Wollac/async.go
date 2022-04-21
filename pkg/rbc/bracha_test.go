@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/wollac/async.go/pgk/config"
+	"github.com/wollac/async.go/pkg/config"
 )
 
 var testData = []byte{0xff}

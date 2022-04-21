@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/wollac/async.go/pgk/config"
-	"github.com/wollac/async.go/pgk/rbc"
+	"github.com/wollac/async.go/pkg/config"
+	"github.com/wollac/async.go/pkg/rbc"
 	"go.dedis.ch/kyber/v3/share"
 	"go.dedis.ch/kyber/v3/suites"
 )

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/wollac/async.go/pgk/acss/crypto"
-	"github.com/wollac/async.go/pgk/config"
-	"github.com/wollac/async.go/pgk/rbc"
+	"github.com/wollac/async.go/pkg/acss/crypto"
+	"github.com/wollac/async.go/pkg/config"
+	"github.com/wollac/async.go/pkg/rbc"
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/suites"
 	"go.uber.org/atomic"

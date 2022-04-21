@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/wollac/async.go/pgk/config"
+	"github.com/wollac/async.go/pkg/config"
 	"go.uber.org/atomic"
 )
 
