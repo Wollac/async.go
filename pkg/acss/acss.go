@@ -16,6 +16,7 @@ import (
 var (
 	ErrStopped       = errors.New("process stopped")
 	ErrInvalidSender = errors.New("invalid sender")
+	ErrDataLength    = errors.New("data too long")
 )
 
 type OutMessage struct {
@@ -26,14 +27,15 @@ type OutMessage struct {
 type ACSS struct {
 	sync.Mutex
 
-	conf  *config.Config
-	suite suites.Suite
+	suite     suites.Suite
+	conf      *config.Config
+	maxLength int // maximum length of ACSS messages in bytes
 
 	rbc *rbc.RBC
 
-	rbcDone bool         // whether the RBC has finished
-	deal    *crypto.Deal // deal distributed by the dealer
-	share   crypto.Share // own private share of the secret
+	rbcDone bool          // whether the RBC has finished
+	deal    *crypto.Deal  // deal distributed by the dealer
+	share   *crypto.Share // own private share of the secret
 
 	cache map[string]map[MessageType]*Message // ACSS messages received during RBC
 
@@ -48,19 +50,20 @@ type ACSS struct {
 
 	reveal         bool
 	revealIDs      map[string]struct{}
-	revealedShares map[string]crypto.Share
+	revealedShares map[string]*crypto.Share
 
 	output     bool
-	outputChan chan crypto.Share
+	outputChan chan *crypto.Share
 
 	stopped atomic.Bool
 	close   chan struct{}
 }
 
-func New(conf *config.Config, suite suites.Suite, dealer string) *ACSS {
+func New(suite suites.Suite, conf *config.Config, dealer string) *ACSS {
 	acss := &ACSS{
-		conf:           conf,
 		suite:          suite,
+		conf:           conf,
+		maxLength:      crypto.ImplicateLen(suite),
 		rbc:            rbc.New(conf, dealer, crypto.DealLen(suite, conf.N()), nil),
 		rbcDone:        false,
 		deal:           nil,
@@ -73,9 +76,9 @@ func New(conf *config.Config, suite suites.Suite, dealer string) *ACSS {
 		implicateIDs:   map[string]struct{}{},
 		reveal:         false,
 		revealIDs:      map[string]struct{}{},
-		revealedShares: map[string]crypto.Share{},
+		revealedShares: map[string]*crypto.Share{},
 		output:         false,
-		outputChan:     make(chan crypto.Share, 1),
+		outputChan:     make(chan *crypto.Share, 1),
 		stopped:        atomic.Bool{},
 		close:          make(chan struct{}),
 	}
@@ -119,12 +122,18 @@ func (a *ACSS) run() {
 
 		// messages of the rbc engine are forwarded
 		case rbcMessage := <-a.rbc.Messages():
+			if a.Stopped() {
+				return
+			}
 			data, _ := rbcMessage.Payload.MarshalBinary()
 			msg := &Message{RBC, data}
 			a.messagesChan <- &OutMessage{rbcMessage.Receiver, msg}
 
 		// handle the output as soon as the rbc engine is done
 		case rbcOutput := <-a.rbc.Output():
+			if a.Stopped() {
+				return
+			}
 			a.handleRBC(rbcOutput)
 
 		// acss has been stopped
@@ -135,7 +144,7 @@ func (a *ACSS) run() {
 }
 
 // Output receives the final share.
-func (a *ACSS) Output() chan crypto.Share {
+func (a *ACSS) Output() chan *crypto.Share {
 	return a.outputChan
 }
 
@@ -146,7 +155,7 @@ func (a *ACSS) Messages() <-chan *OutMessage {
 
 // Handle must be called for each incoming message of other peers.
 func (a *ACSS) Handle(sender string, msg *Message) error {
-	if a.stopped.Load() {
+	if a.Stopped() {
 		return ErrStopped
 	}
 	if !a.conf.HasPeer(sender) {
@@ -161,10 +170,14 @@ func (a *ACSS) Handle(sender string, msg *Message) error {
 		}
 		return a.rbc.Handle(sender, &rbcMessage)
 	}
+	// apply length limit to non-RBC messages
+	if len(msg.Data) > a.maxLength {
+		return ErrDataLength
+	}
 
 	a.Lock()
 	defer a.Unlock()
-	if a.stopped.Load() {
+	if a.Stopped() {
 		return ErrStopped
 	}
 
@@ -191,16 +204,17 @@ func (a *ACSS) handleRBC(data []byte) {
 
 	a.rbcDone = true
 	deal, err := crypto.DealUnmarshalBinary(a.suite, a.conf.N(), data)
+	// TODO: if the deal is faulty, there is nothing we can do and we will never output
 	if err == nil {
 		a.deal = deal
 
 		// try to extract our share
 		secret := crypto.Secret(a.suite, a.deal.PubKey, a.conf.Self().PrivKey)
 		a.share, err = crypto.DecryptShare(a.suite, a.deal, a.conf.SelfIndex(), secret)
-		if err != nil {
-			a.doImplicate()
-		} else {
+		if err == nil {
 			a.doOK()
+		} else {
+			a.doImplicate()
 		}
 	}
 
@@ -332,7 +346,7 @@ func (a *ACSS) handleReveal(sender string, data []byte) error {
 	// store the resulting revealed share
 	a.revealedShares[sender] = s
 	if len(a.revealedShares) > a.conf.F() {
-		var shares []crypto.Share
+		var shares []*crypto.Share
 		for _, priShare := range a.revealedShares {
 			shares = append(shares, priShare)
 		}

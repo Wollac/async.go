@@ -1,8 +1,9 @@
 module github.com/wollac/async.go
 
-go 1.17
+go 1.18
 
 require (
+	github.com/asaskevich/EventBus v0.0.0-20200907212545-49d423059eef
 	github.com/stretchr/testify v1.7.1
 	go.dedis.ch/kyber/v3 v3.0.13
 	go.uber.org/atomic v1.9.0
