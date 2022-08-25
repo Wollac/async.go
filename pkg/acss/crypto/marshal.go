@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"encoding"
 	"fmt"
 	"io"
 
@@ -50,4 +51,12 @@ func scalarUnmarshalBinary(s kyber.Scalar, data []byte) error {
 		return ErrNotCanonical
 	}
 	return nil
+}
+
+func mustMarshalBinary(m encoding.BinaryMarshaler) []byte {
+	data, err := m.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+	return data
 }

@@ -60,12 +60,11 @@ func SecretLen(g kyber.Group) int { return g.PointLen() }
 
 // Secret computes and returns the shared ephemeral secret.
 func Secret(g kyber.Group, remotePublic kyber.Point, ownPrivate kyber.Scalar) []byte {
-	dh := g.Point().Mul(ownPrivate, remotePublic)
-	data, err := dh.MarshalBinary()
-	if err != nil {
-		panic(err)
+	if i, ok := remotePublic.(interface{ HasSmallOrder() bool }); ok && i.HasSmallOrder() {
+		panic("bad input point: low order point")
 	}
-	return data
+	dh := g.Point().Mul(ownPrivate, remotePublic)
+	return mustMarshalBinary(dh)
 }
 
 // ShareLen returns the length of an encrypted share in bytes.
@@ -78,24 +77,33 @@ func DecryptShare(g kyber.Group, deal *Deal, index int, secret []byte) (*share.P
 		return nil, ErrInvalidInputLength
 	}
 
-	salt, _ := deal.Commits.MarshalBinary()
+	salt := mustMarshalBinary(deal.Commits)
 	aead := newAEAD(secret, salt, contextInfo(index))
 	v := g.Scalar()
 	if err := decryptScalar(v, aead, deal.Shares[index]); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrDecryptionFailed, err)
 	}
 	s := &share.PriShare{I: index, V: v}
-	if !share.NewPubPoly(g, nil, deal.Commits).Check(s) {
+	if !checkShare(g, deal.Commits, s) {
 		return nil, ErrVerificationFailed
 	}
 	return s, nil
 }
 
 // InterpolateShare interpolates a new private share for index i.
-func InterpolateShare(g kyber.Group, shares []*Share, n int, i int) (*Share, error) {
+func InterpolateShare(g kyber.Group, deal *Deal, shares []*Share, n int, i int) (*Share, error) {
 	poly, err := share.RecoverPriPoly(g, shares, threshold(n), n)
 	if err != nil {
 		return nil, err
 	}
-	return poly.Eval(i), nil
+	s := poly.Eval(i)
+	// this is just a sanity check; if all shares are valid the interpolation will also be valid
+	if !checkShare(g, deal.Commits, s) {
+		return nil, ErrVerificationFailed
+	}
+	return s, nil
+}
+
+func checkShare(g kyber.Group, commits []kyber.Point, s *share.PriShare) bool {
+	return share.NewPubPoly(g, nil, commits).Check(s)
 }

@@ -54,10 +54,7 @@ func NewDeal(suite suites.Suite, pubKeys []kyber.Point, scalar kyber.Scalar) *De
 	// generate a private share for each peer
 	priShares := poly.Shares(n)
 
-	salt, err := deal.Commits.MarshalBinary()
-	if err != nil {
-		panic(err)
-	}
+	salt := mustMarshalBinary(deal.Commits)
 
 	// encrypt the shares for each public key
 	deal.Shares = make([][]byte, n)

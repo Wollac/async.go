@@ -2,12 +2,16 @@ package crypto
 
 import (
 	"bytes"
-	"crypto/sha512"
+	"crypto"
+	_ "crypto/sha512"
 	"fmt"
 
 	"go.dedis.ch/kyber/v3"
 	"go.dedis.ch/kyber/v3/suites"
 )
+
+// used hash function
+var hash = crypto.SHA512
 
 // ImplicateLen returns the length of Implicate in bytes.
 func ImplicateLen(g kyber.Group) int {
@@ -20,14 +24,14 @@ func Implicate(suite suites.Suite, dealerPublic kyber.Point, ownPrivate kyber.Sc
 	var buf bytes.Buffer
 	buf.Write(Secret(suite, dealerPublic, ownPrivate))
 
-	s, R1, R2 := dleqProof(suite, nil, dealerPublic, ownPrivate)
-	if _, err := s.MarshalTo(&buf); err != nil {
+	p := proveDLEQ(suite, suite.Point().Base(), dealerPublic, ownPrivate)
+	if _, err := p.sigma.MarshalTo(&buf); err != nil {
 		panic(err)
 	}
-	if _, err := R1.MarshalTo(&buf); err != nil {
+	if _, err := p.R1.MarshalTo(&buf); err != nil {
 		panic(err)
 	}
-	if _, err := R2.MarshalTo(&buf); err != nil {
+	if _, err := p.R2.MarshalTo(&buf); err != nil {
 		panic(err)
 	}
 
@@ -47,8 +51,8 @@ func CheckImplicate(g kyber.Group, dealerPublic kyber.Point, peerPublic kyber.Po
 		return nil, fmt.Errorf("invalid shared key: %w", err)
 	}
 
-	s := g.Scalar()
-	if _, err := ScalarUnmarshalFrom(s, buf); err != nil {
+	sigma := g.Scalar()
+	if _, err := ScalarUnmarshalFrom(sigma, buf); err != nil {
 		return nil, fmt.Errorf("invalid proof: %w", err)
 	}
 	R1 := g.Point()
@@ -60,56 +64,72 @@ func CheckImplicate(g kyber.Group, dealerPublic kyber.Point, peerPublic kyber.Po
 		return nil, fmt.Errorf("invalid proof: %w", err)
 	}
 
-	if !dleqVerify(g, nil, dealerPublic, peerPublic, K, s, R1, R2) {
+	if !verifyDLEQ(g, g.Point().Base(), dealerPublic, peerPublic, K, proof{sigma, R1, R2}) {
 		return nil, ErrVerificationFailed
 	}
-	secret, _ := K.MarshalBinary()
-	return secret, nil
+	return mustMarshalBinary(K), nil
 }
 
-func dleqProof(suite suites.Suite, G kyber.Point, H kyber.Point, secret kyber.Scalar) (kyber.Scalar, kyber.Point, kyber.Point) {
-	// compute the corresponding public keys
-	P1 := suite.Point().Mul(secret, G)
-	P2 := suite.Point().Mul(secret, H)
+// proof stores the proof constructed by proveDLEQ.
+type proof struct {
+	sigma  kyber.Scalar
+	R1, R2 kyber.Point
+}
+
+// proveDLEQ constructs a proof that the prover knows s with S1=s⋅G and S2=s⋅H.
+func proveDLEQ(suite suites.Suite, G kyber.Point, H kyber.Point, s kyber.Scalar) proof {
+	// statement
+	S1 := suite.Point().Mul(s, G)
+	S2 := suite.Point().Mul(s, H)
 
 	// commitment
+	// R1, R2 ← r⋅G, r⋅B
 	r := suite.Scalar().Pick(suite.RandomStream())
 	R1 := suite.Point().Mul(r, G)
 	R2 := suite.Point().Mul(r, H)
 
-	// challenge hash
-	h := sha512.New()
-	P1.MarshalTo(h)
-	P2.MarshalTo(h)
+	// challenge
+	// c ← H(G ∥ H ∥ S1 ∥ S2 ∥ R1 ∥ R2)
+	h := hash.New()
+	G.MarshalTo(h)
+	H.MarshalTo(h)
+	S1.MarshalTo(h)
+	S2.MarshalTo(h)
 	R1.MarshalTo(h)
 	R2.MarshalTo(h)
-	c := suite.Scalar().SetBytes(h.Sum(nil))
+	digest := make([]byte, 0, hash.Size())
+	digest = h.Sum(digest)
+	c := suite.Scalar().SetBytes(digest)
 
 	// response
-	s := suite.Scalar()
-	s.Mul(secret, c).Add(s, r)
+	// σ ← c⋅s + r
+	sigma := suite.Scalar()
+	sigma.Mul(s, c).Add(sigma, r)
 
-	return s, R1, R2
+	return proof{sigma, R1, R2}
 }
 
-func dleqVerify(g kyber.Group, G kyber.Point, H kyber.Point, P1 kyber.Point, P2 kyber.Point, s kyber.Scalar, R1 kyber.Point, R2 kyber.Point) bool {
-	// challenge hash
-	h := sha512.New()
-	P1.MarshalTo(h)
-	P2.MarshalTo(h)
-	R1.MarshalTo(h)
-	R2.MarshalTo(h)
-	c := g.Scalar().SetBytes(h.Sum(nil))
+// verifyDLEQ validates a proof whether the prover knows s with S1=s⋅G and S2=s⋅H.
+func verifyDLEQ(g kyber.Group, G kyber.Point, H kyber.Point, S1 kyber.Point, S2 kyber.Point, p proof) bool {
+	// c ← H(G ∥ H ∥ S1 ∥ S2 ∥ R1 ∥ R2)
+	h := hash.New()
+	G.MarshalTo(h)
+	H.MarshalTo(h)
+	S1.MarshalTo(h)
+	S2.MarshalTo(h)
+	p.R1.MarshalTo(h)
+	p.R2.MarshalTo(h)
+	digest := make([]byte, 0, hash.Size())
+	digest = h.Sum(digest)
+	c := g.Scalar().SetBytes(digest)
 
-	P := g.Point()
+	// validate
+	// (σ⋅G == c⋅S1 + R1) ∧ (σ⋅H == c⋅S2 + R2)
+	left := g.Point()
+	left.Add(G, H).Mul(p.sigma, left)
 
-	// s * G == c * P1 + R1
-	P = P.Mul(c, P1).Add(P, R1)
-	if !g.Point().Mul(s, G).Equal(P) {
-		return false
-	}
+	right := g.Point()
+	right.Add(S1, S2).Mul(c, right).Add(right, p.R1).Add(right, p.R2)
 
-	// s * H == c * P2 + R2
-	P = P.Mul(c, P2).Add(P, R2)
-	return g.Point().Mul(s, H).Equal(P)
+	return left.Equal(right)
 }

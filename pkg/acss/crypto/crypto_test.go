@@ -26,22 +26,25 @@ func TestDecryptShare(t *testing.T) {
 	poly := share.NewPriPoly(suite, 1, secret, suite.RandomStream())
 	_, deal.Commits = poly.Commit(nil).Info()
 	deal.PubKey = dealerPubKey
-	salt, _ := deal.Commits.MarshalBinary()
-	aead := newAEAD(Secret(suite, peerPubKey, dealerPrivKey), salt, contextInfo(0))
+	salt := mustMarshalBinary(deal.Commits)
+	dealerSecret := Secret(suite, peerPubKey, dealerPrivKey)
+	aead := newAEAD(dealerSecret, salt, contextInfo(0))
 	deal.Shares = [][]byte{encryptScalar(poly.Eval(0).V, aead)}
 	require.Len(t, deal.Shares[0], ShareLen(suite))
 
-	s, err := DecryptShare(suite, &deal, 0, Secret(suite, dealerPubKey, peerPrivKey))
+	peerSecret := Secret(suite, dealerPubKey, peerPrivKey)
+	require.Equal(t, dealerSecret, peerSecret)
+	s, err := DecryptShare(suite, &deal, 0, peerSecret)
 	require.NoError(t, err)
 	require.Equal(t, &share.PriShare{I: 0, V: secret}, s)
 
 	// decryption fails
 	deal.Shares[0][ShareLen(suite)-1]++
-	_, err = DecryptShare(suite, &deal, 0, Secret(suite, dealerPubKey, peerPrivKey))
+	_, err = DecryptShare(suite, &deal, 0, peerSecret)
 	require.ErrorIs(t, err, ErrDecryptionFailed)
 
 	// verification fails
 	deal.Shares[0] = encryptScalar(suite.Scalar().Zero(), aead)
-	_, err = DecryptShare(suite, &deal, 0, Secret(suite, dealerPubKey, peerPrivKey))
+	_, err = DecryptShare(suite, &deal, 0, peerSecret)
 	require.ErrorIs(t, err, ErrVerificationFailed)
 }

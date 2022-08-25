@@ -55,5 +55,5 @@ func decryptScalar(dst kyber.Scalar, aead cipher.AEAD, cipherText []byte) error 
 }
 
 func contextInfo(index int) []byte {
-	return []byte(fmt.Sprintf("ACSS-%d", index))
+	return []byte(fmt.Sprintf("ACSS/key-%d", index))
 }
